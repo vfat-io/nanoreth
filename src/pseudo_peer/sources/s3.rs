@@ -4,7 +4,7 @@ use aws_sdk_s3::types::RequestPayer;
 use futures::{FutureExt, future::BoxFuture};
 use reth_metrics::{Metrics, metrics, metrics::Counter};
 use std::{sync::Arc, time::Duration};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Block source that reads blocks from S3 (--s3)
 #[derive(Debug, Clone)]
@@ -71,19 +71,59 @@ impl BlockSource for S3BlockSource {
         let metrics = self.metrics.clone();
         async move {
             let path = utils::rmp_path(height);
-            metrics.polling_attempt.increment(1);
 
-            let request = client
-                .get_object()
-                .request_payer(RequestPayer::Requester)
-                .bucket(&bucket)
-                .key(path);
-            let response = request.send().await?;
-            metrics.fetched.increment(1);
-            let bytes = response.body.collect().await?.into_bytes();
-            let mut decoder = lz4_flex::frame::FrameDecoder::new(&bytes[..]);
-            let blocks: Vec<BlockAndReceipts> = rmp_serde::from_read(&mut decoder)?;
-            Ok(blocks[0].clone())
+            let mut last_error = None;
+            for attempt in 1..=20 {
+                metrics.polling_attempt.increment(1);
+
+                let request = client
+                    .get_object()
+                    .request_payer(RequestPayer::Requester)
+                    .bucket(&bucket)
+                    .key(&path);
+
+                let response = match request.send().await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        last_error = Some(eyre::eyre!(error));
+                        warn!(height, attempt, error = ?last_error, "S3 get_object failed");
+                        tokio::time::sleep(Duration::from_millis((250 * attempt).min(2_000))).await;
+                        continue;
+                    }
+                };
+
+                let bytes = match response.body.collect().await {
+                    Ok(bytes) => bytes.into_bytes(),
+                    Err(error) => {
+                        last_error = Some(eyre::eyre!(error));
+                        warn!(height, attempt, error = ?last_error, "S3 body stream failed");
+                        tokio::time::sleep(Duration::from_millis((250 * attempt).min(2_000))).await;
+                        continue;
+                    }
+                };
+
+                let mut decoder = lz4_flex::frame::FrameDecoder::new(&bytes[..]);
+                let blocks: Vec<BlockAndReceipts> = match rmp_serde::from_read(&mut decoder) {
+                    Ok(blocks) => blocks,
+                    Err(error) => {
+                        last_error = Some(eyre::eyre!(error));
+                        warn!(height, attempt, error = ?last_error, "S3 block decode failed");
+                        tokio::time::sleep(Duration::from_millis((250 * attempt).min(2_000))).await;
+                        continue;
+                    }
+                };
+
+                if let Some(block) = blocks.first() {
+                    metrics.fetched.increment(1);
+                    return Ok(block.clone());
+                }
+
+                last_error = Some(eyre::eyre!("S3 object decoded with no blocks"));
+                warn!(height, attempt, error = ?last_error, "S3 object was empty");
+                tokio::time::sleep(Duration::from_millis((250 * attempt).min(2_000))).await;
+            }
+
+            Err(last_error.unwrap_or_else(|| eyre::eyre!("S3 block fetch failed")))
         }
         .boxed()
     }
@@ -138,7 +178,7 @@ impl BlockSource for S3BlockSource {
     }
 
     fn recommended_chunk_size(&self) -> u64 {
-        1000
+        50
     }
 
     fn polling_interval(&self) -> Duration {
