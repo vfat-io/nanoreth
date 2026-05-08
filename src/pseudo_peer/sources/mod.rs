@@ -5,12 +5,14 @@ use std::{sync::Arc, time::Duration};
 
 // Module declarations
 mod hl_node;
+mod fallback;
 mod local;
 mod rpc;
 mod s3;
 mod utils;
 
 // Public exports
+pub use fallback::FallbackBlockSource;
 pub use hl_node::{HlNodeBlockSource, HlNodeBlockSourceArgs};
 pub use local::LocalBlockSource;
 pub use rpc::RpcBlockSource;

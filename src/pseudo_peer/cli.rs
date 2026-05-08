@@ -56,6 +56,17 @@ impl BlockSourceArgs {
 
     async fn create_base_config(&self) -> eyre::Result<Option<BlockSourceConfig>> {
         if self.s3 {
+            if let Some(value) = self.block_source.as_ref() {
+                if !value.starts_with("s3://") && !value.starts_with("rpc://") {
+                    return Ok(Some(BlockSourceConfig::local_then_s3(
+                        value.into(),
+                        Duration::from_millis(self.s3_polling_interval),
+                    )));
+                }
+            }
+        }
+
+        if self.s3 {
             return Ok(Some(
                 BlockSourceConfig::s3_default(Duration::from_millis(self.s3_polling_interval))
                     .await,

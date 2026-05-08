@@ -3,7 +3,7 @@ use crate::chainspec::HlChainSpec;
 use super::{
     block_store::{BlockStore, DbBlockNumberFn},
     sources::{
-        BlockSourceBoxed, HlNodeBlockSource, HlNodeBlockSourceArgs,
+        FallbackBlockSource, BlockSourceBoxed, HlNodeBlockSource, HlNodeBlockSourceArgs,
         LocalBlockSource, RpcBlockSource, S3BlockSource,
     },
 };
@@ -21,6 +21,7 @@ pub enum BlockSourceType {
     S3Default { polling_interval: Duration },
     S3 { bucket: String, polling_interval: Duration },
     Local { path: PathBuf },
+    LocalThenS3 { path: PathBuf, polling_interval: Duration },
     Rpc { url: String, polling_interval: Duration },
 }
 
@@ -41,6 +42,13 @@ impl BlockSourceConfig {
 
     pub fn local(path: PathBuf) -> Self {
         Self { source_type: BlockSourceType::Local { path }, block_source_from_node: None }
+    }
+
+    pub fn local_then_s3(path: PathBuf, polling_interval: Duration) -> Self {
+        Self {
+            source_type: BlockSourceType::LocalThenS3 { path, polling_interval },
+            block_source_from_node: None,
+        }
     }
 
     pub fn rpc(url: String, polling_interval: Duration) -> Self {
@@ -81,6 +89,12 @@ impl BlockSourceConfig {
             }
             BlockSourceType::Local { path } => {
                 Arc::new(Box::new(LocalBlockSource::new(path.clone())))
+            }
+            BlockSourceType::LocalThenS3 { path, polling_interval } => {
+                let local: BlockSourceBoxed =
+                    Arc::new(Box::new(LocalBlockSource::new(path.clone())));
+                let s3 = s3_block_source(chain_spec.official_s3_bucket(), *polling_interval).await;
+                Arc::new(Box::new(FallbackBlockSource::new(local, s3)))
             }
             BlockSourceType::Rpc { url, polling_interval } => {
                 Arc::new(Box::new(RpcBlockSource::new(url.clone(), *polling_interval)))
