@@ -6,6 +6,9 @@ use reth_metrics::{Metrics, metrics, metrics::Counter};
 use std::{sync::Arc, time::Duration};
 use tracing::{info, warn};
 
+const DEFAULT_CONCURRENCY: u64 = 50;
+const MAX_CONCURRENCY: u64 = 1000;
+
 /// Block source that reads blocks from S3 (--s3)
 #[derive(Debug, Clone)]
 pub struct S3BlockSource {
@@ -178,7 +181,11 @@ impl BlockSource for S3BlockSource {
     }
 
     fn recommended_chunk_size(&self) -> u64 {
-        50
+        std::env::var("S3_BLOCK_SOURCE_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| (1..=MAX_CONCURRENCY).contains(value))
+            .unwrap_or(DEFAULT_CONCURRENCY)
     }
 
     fn polling_interval(&self) -> Duration {
