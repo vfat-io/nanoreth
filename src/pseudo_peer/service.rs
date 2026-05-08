@@ -26,6 +26,8 @@ use std::{
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{debug, info, warn};
 
+const MAX_HEADERS_PER_RESPONSE: u64 = 1000;
+
 /// A block poller that polls blocks from `BlockStore` and sends them to the `block_tx`
 #[derive(Debug)]
 pub struct BlockPoller {
@@ -155,10 +157,23 @@ impl PseudoPeer {
                     HashOrNumber::Number(number) => number,
                 };
 
+                let capped_limit = limit.min(MAX_HEADERS_PER_RESPONSE);
+                if capped_limit < limit {
+                    debug!(
+                        requested_limit = limit,
+                        capped_limit,
+                        "Capping GetBlockHeaders response"
+                    );
+                }
+
                 let blocks = match direction {
-                    HeadersDirection::Rising => self.collect_blocks(number..number + limit).await,
+                    HeadersDirection::Rising => {
+                        self.collect_blocks(number..number.saturating_add(capped_limit)).await
+                    }
                     HeadersDirection::Falling => {
-                        self.collect_blocks((number + 1 - limit..number + 1).rev()).await
+                        let end = number.saturating_add(1);
+                        let start = end.saturating_sub(capped_limit);
+                        self.collect_blocks((start..end).rev()).await
                     }
                 }?;
 
