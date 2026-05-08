@@ -33,11 +33,12 @@ RUN cargo chef cook --profile $BUILD_PROFILE --features "$FEATURES" --recipe-pat
 
 # Build application
 COPY --exclude=dist . .
-RUN cargo build --profile $BUILD_PROFILE --features "$FEATURES" --locked --bin reth-hl
+RUN cargo build --profile $BUILD_PROFILE --features "$FEATURES" --locked --bin reth-hl --bin reth-hl-pseudo-peer
 
 # ARG is not resolved in COPY so we have to hack around it by copying the
 # binary to a temporary location
 RUN cp /app/target/$BUILD_PROFILE/reth-hl /app/reth-hl
+RUN cp /app/target/$BUILD_PROFILE/reth-hl-pseudo-peer /app/reth-hl-pseudo-peer
 
 # Use Ubuntu as the release image
 FROM ubuntu AS runtime
@@ -48,6 +49,7 @@ RUN apt-get update && apt-get install -y ca-certificates && update-ca-certificat
 
 # Copy reth over from the build stage
 COPY --from=builder /app/reth-hl /usr/local/bin
+COPY --from=builder /app/reth-hl-pseudo-peer /usr/local/bin
 
 # Copy licenses
 COPY LICENSE-* ./

@@ -12,6 +12,10 @@ path = "src/lib.rs"
 name = "reth-hl"
 path = "src/main.rs"
 
+[[bin]]
+name = "reth-hl-pseudo-peer"
+path = "src/bin/pseudo-peer.rs"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
