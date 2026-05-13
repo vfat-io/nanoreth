@@ -315,6 +315,7 @@ where
                     local_node_record.to_string(),
                     block_store,
                     debug_cutoff_height,
+                    Some(next_block_number),
                 )
                 .await
                 .unwrap();

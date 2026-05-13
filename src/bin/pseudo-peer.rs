@@ -24,5 +24,5 @@ async fn main() -> eyre::Result<()> {
         .await;
 
     info!(destination_peer = %command.destination_peer, "Starting standalone pseudo peer");
-    start_pseudo_peer(chain_spec, command.destination_peer, block_store, None).await
+    start_pseudo_peer(chain_spec, command.destination_peer, block_store, None, None).await
 }

@@ -39,12 +39,19 @@ use reth_network::{NetworkEvent, NetworkEventListenerProvider};
 use reth_network_api::Peers;
 use std::str::FromStr;
 
+fn block_poller_enabled() -> bool {
+    std::env::var("NANORETH_DISABLE_BLOCK_POLLER")
+        .map(|value| !matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(true)
+}
+
 /// Main function that starts the network manager and processes eth requests
 pub async fn start_pseudo_peer(
     chain_spec: Arc<HlChainSpec>,
     destination_peer: String,
     block_store: Arc<BlockStore>,
     debug_cutoff_height: Option<u64>,
+    start_block_number: Option<u64>,
 ) -> eyre::Result<()> {
 
     // Parse the destination peer enode string
@@ -56,6 +63,7 @@ pub async fn start_pseudo_peer(
         (*chain_spec).clone(),
         block_store.clone(),
         debug_cutoff_height,
+        start_block_number,
     )
     .await?;
 
@@ -72,6 +80,10 @@ pub async fn start_pseudo_peer(
 
     let mut service = PseudoPeer::new(chain_spec, block_store);
     tokio::spawn(network);
+    let start_block_poller = block_poller_enabled();
+    if !start_block_poller {
+        info!("Block poller disabled by NANORETH_DISABLE_BLOCK_POLLER");
+    }
 
     // Directly add the main node as a peer (bypasses discovery)
     info!(
@@ -88,7 +100,7 @@ pub async fn start_pseudo_peer(
         tokio::select! {
             Some(event) = tokio_stream::StreamExt::next(&mut network_events) => {
                 info!("Network event: {event:?}");
-                if matches!(event, NetworkEvent::ActivePeerSession { .. }) && first {
+                if start_block_poller && matches!(event, NetworkEvent::ActivePeerSession { .. }) && first {
                     start_tx.send(()).await?;
                     first = false;
                 }

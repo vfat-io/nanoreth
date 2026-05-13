@@ -42,11 +42,13 @@ impl BlockPoller {
         chain_id: u64,
         block_store: Arc<BlockStore>,
         debug_cutoff_height: Option<u64>,
+        start_block_number: Option<u64>,
     ) -> (Self, mpsc::Sender<()>) {
         let (start_tx, start_rx) = mpsc::channel(1);
         let (block_tx, block_rx) = mpsc::channel(100);
         let store = block_store.clone();
-        let task = tokio::spawn(Self::task(start_rx, store, block_tx, debug_cutoff_height));
+        let task =
+            tokio::spawn(Self::task(start_rx, store, block_tx, debug_cutoff_height, start_block_number));
         (Self { chain_id, block_rx, task, block_store }, start_tx)
     }
 
@@ -60,15 +62,22 @@ impl BlockPoller {
         block_store: Arc<BlockStore>,
         block_tx: mpsc::Sender<(u64, BlockAndReceipts)>,
         debug_cutoff_height: Option<u64>,
+        start_block_number: Option<u64>,
     ) -> eyre::Result<()> {
         start_rx.recv().await.ok_or(eyre::eyre!("Failed to receive start signal"))?;
         info!("Starting block poller");
 
         let polling_interval = block_store.polling_interval();
-        let mut next_block_number = block_store
-            .find_latest_block_number()
-            .await
-            .ok_or(eyre::eyre!("Failed to find latest block number"))?;
+        let mut next_block_number = match start_block_number {
+            Some(block_number) => {
+                info!(block_number, "Starting block poller from configured block");
+                block_number
+            }
+            None => block_store
+                .find_latest_block_number()
+                .await
+                .ok_or(eyre::eyre!("Failed to find latest block number"))?,
+        };
 
         loop {
             if let Some(debug_cutoff_height) = debug_cutoff_height &&
