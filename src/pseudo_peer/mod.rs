@@ -50,17 +50,28 @@ fn configure_pseudo_peer_connection(
     pseudo_peer.add_trusted_peer(destination_record.id, destination_record.tcp_addr());
 }
 
+fn block_poller_enabled() -> bool {
+    std::env::var("NANORETH_DISABLE_BLOCK_POLLER")
+        .map(|value| !matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(true)
+}
+
 /// Main function that starts the network manager and processes eth requests
 pub async fn start_pseudo_peer(
     chain_spec: Arc<HlChainSpec>,
     destination_network: NetworkHandle<HlNetworkPrimitives>,
     block_store: Arc<BlockStore>,
     debug_cutoff_height: Option<u64>,
+    start_block_number: Option<u64>,
 ) -> eyre::Result<()> {
     // Create network manager (no boot_nodes — we add the peer directly)
-    let (mut network, start_tx) =
-        create_network_manager((*chain_spec).clone(), block_store.clone(), debug_cutoff_height)
-            .await?;
+    let (mut network, start_tx) = create_network_manager(
+        (*chain_spec).clone(),
+        block_store.clone(),
+        debug_cutoff_height,
+        start_block_number,
+    )
+    .await?;
 
     // Create the channels for receiving eth messages
     let (eth_tx, mut eth_rx) = mpsc::channel(32);
@@ -75,6 +86,10 @@ pub async fn start_pseudo_peer(
 
     let mut service = PseudoPeer::new(chain_spec, block_store);
     tokio::spawn(network);
+    let start_block_poller = block_poller_enabled();
+    if !start_block_poller {
+        info!("Block poller disabled by NANORETH_DISABLE_BLOCK_POLLER");
+    }
 
     // Directly add the main node as a peer (bypasses discovery)
     let node_record = destination_network.local_node_record();
@@ -92,7 +107,7 @@ pub async fn start_pseudo_peer(
         tokio::select! {
             Some(event) = tokio_stream::StreamExt::next(&mut network_events) => {
                 info!("Network event: {event:?}");
-                if matches!(event, NetworkEvent::ActivePeerSession { .. }) && first {
+                if start_block_poller && matches!(event, NetworkEvent::ActivePeerSession { .. }) && first {
                     start_tx.send(()).await?;
                     first = false;
                 }

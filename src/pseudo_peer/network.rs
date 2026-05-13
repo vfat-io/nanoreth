@@ -18,6 +18,7 @@ pub struct NetworkBuilder {
     listener_port: u16,
     chain_spec: HlChainSpec,
     debug_cutoff_height: Option<u64>,
+    start_block_number: Option<u64>,
 }
 
 impl Default for NetworkBuilder {
@@ -29,6 +30,7 @@ impl Default for NetworkBuilder {
             listener_port: 0,
             chain_spec: HlChainSpec::default(),
             debug_cutoff_height: None,
+            start_block_number: None,
         }
     }
 }
@@ -41,6 +43,11 @@ impl NetworkBuilder {
 
     pub fn with_debug_cutoff_height(mut self, debug_cutoff_height: Option<u64>) -> Self {
         self.debug_cutoff_height = debug_cutoff_height;
+        self
+    }
+
+    pub fn with_start_block_number(mut self, start_block_number: Option<u64>) -> Self {
+        self.start_block_number = start_block_number;
         self
     }
 
@@ -60,6 +67,7 @@ impl NetworkBuilder {
             chain_id,
             block_store,
             self.debug_cutoff_height,
+            self.start_block_number,
         );
         let config = builder.block_import(Box::new(block_poller)).build(Arc::new(NoopProvider::<
             HlChainSpec,
@@ -77,10 +85,12 @@ pub async fn create_network_manager(
     chain_spec: HlChainSpec,
     block_store: Arc<BlockStore>,
     debug_cutoff_height: Option<u64>,
+    start_block_number: Option<u64>,
 ) -> eyre::Result<(NetworkManager<HlNetworkPrimitives>, mpsc::Sender<()>)> {
     NetworkBuilder::default()
         .with_chain_spec(chain_spec)
         .with_debug_cutoff_height(debug_cutoff_height)
+        .with_start_block_number(start_block_number)
         .build(block_store)
         .await
 }

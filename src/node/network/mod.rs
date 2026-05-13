@@ -316,6 +316,7 @@ where
                     destination_network,
                     block_store,
                     debug_cutoff_height,
+                    Some(next_block_number),
                 )
                 .await
                 .unwrap();
