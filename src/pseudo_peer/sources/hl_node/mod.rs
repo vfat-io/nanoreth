@@ -66,8 +66,13 @@ impl BlockSource for HlNodeBlockSource {
         Box::pin(async move {
             let now = OffsetDateTime::now_utc();
 
-            if let Some(block) =
-                Self::try_collect_local_block(&metrics, local_blocks_cache, height).await
+            if let Some(block) = Self::try_collect_local_block(
+                &metrics,
+                &args.root,
+                local_blocks_cache,
+                height,
+            )
+            .await
             {
                 Self::update_last_fetch(last_local_fetch, height, now).await;
                 metrics.fetched_from_hl_node.increment(1);
@@ -172,14 +177,28 @@ impl HlNodeBlockSource {
 
     async fn try_collect_local_block(
         metrics: &HlNodeBlockSourceMetrics,
+        root: &Path,
         local_blocks_cache: Arc<Mutex<LocalBlocksCache>>,
         height: u64,
     ) -> Option<BlockAndReceipts> {
-        let mut u_cache = local_blocks_cache.lock().await;
-        if let Some(block) = u_cache.get_block(height) {
-            return Some(block);
+        let path = {
+            let mut u_cache = local_blocks_cache.lock().await;
+            if let Some(block) = u_cache.get_block(height) {
+                return Some(block);
+            }
+            u_cache.get_path_for_height(height)
         }
-        let path = u_cache.get_path_for_height(height)?;
+        .or_else(|| {
+            FileOperations::all_hourly_files(root)
+                .unwrap_or_default()
+                .into_iter()
+                .rev()
+                .find(|path| {
+                    FileOperations::read_last_block_from_file(path)
+                        .is_some_and(|(_, latest_height)| latest_height >= height)
+                })
+        })?;
+
         info!("Loading block data from {:?}", path);
         metrics.file_read_triggered.increment(1);
         let mut line_stream = LineStream::from_path(&path).ok()?;
@@ -187,6 +206,7 @@ impl HlNodeBlockSource {
             &mut line_stream,
             ScanOptions { start_height: 0, only_load_ranges: false },
         );
+        let mut u_cache = local_blocks_cache.lock().await;
         u_cache.load_scan_result(scan_result);
         u_cache.get_block(height)
     }

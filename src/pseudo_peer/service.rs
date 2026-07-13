@@ -91,7 +91,14 @@ impl BlockPoller {
                     block_tx.send((next_block_number, block)).await?;
                     next_block_number += 1;
                 }
-                Err(_) => tokio::time::sleep(polling_interval).await,
+                Err(e) => {
+                    debug!(
+                        block_number = next_block_number,
+                        error = %e,
+                        "Block poller waiting for block source"
+                    );
+                    tokio::time::sleep(polling_interval).await;
+                }
             }
         }
     }

@@ -34,7 +34,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
-use tracing::info;
+use tracing::{info, warn};
 
 pub mod block_import;
 
@@ -163,7 +163,7 @@ impl HlNetworkBuilder {
     pub fn network_config<Node>(
         self,
         ctx: &BuilderContext<Node>,
-        fcu_trigger_rx: oneshot::Receiver<B256>,
+        mut fcu_trigger_rx: mpsc::UnboundedReceiver<B256>,
     ) -> eyre::Result<NetworkConfig<Node::Provider, HlNetworkPrimitives>>
     where
         Node: FullNodeTypes<Types = HlNode>,
@@ -183,29 +183,36 @@ impl HlNetworkBuilder {
                 .await
                 .unwrap();
 
-            // If a block source provided a target hash, send an initial forkchoice
-            // update to the engine to trigger the pipeline. This is needed because
-            // the pseudo peer's NewBlock announcements via the network layer don't
-            // reliably generate forkchoice updates on this post-merge chain.
-            if let Ok(target_hash) = fcu_trigger_rx.await {
+            let fcu_engine = engine.clone();
+            tokio::spawn(async move {
                 // Use the target hash as finalized so reth's backfill_sync_target()
                 // sees an unknown finalized hash and triggers the pipeline.
                 // If finalized is set to the current best block (which is already
                 // known), reth concludes "fully synced" and never starts backfill.
-                let state = ForkchoiceState {
-                    head_block_hash: target_hash,
-                    safe_block_hash: target_hash,
-                    finalized_block_hash: target_hash,
-                };
-                info!(
-                    target: "reth::cli",
-                    head = %target_hash,
-                    "Sending initial forkchoice update to trigger pipeline"
-                );
-                let _ = engine
-                    .fork_choice_updated(state, None, EngineApiMessageVersion::default())
-                    .await;
-            }
+                while let Some(target_hash) = fcu_trigger_rx.recv().await {
+                    let state = ForkchoiceState {
+                        head_block_hash: target_hash,
+                        safe_block_hash: target_hash,
+                        finalized_block_hash: target_hash,
+                    };
+                    info!(
+                        target: "reth::cli",
+                        head = %target_hash,
+                        "Sending forkchoice update from block source"
+                    );
+                    if let Err(e) = fcu_engine
+                        .fork_choice_updated(state, None, EngineApiMessageVersion::default())
+                        .await
+                    {
+                        warn!(
+                            target: "reth::cli",
+                            head = %target_hash,
+                            %e,
+                            "Failed to send forkchoice update from block source"
+                        );
+                    }
+                }
+            });
 
             ImportService::new(consensus, engine, from_network, to_network).await.unwrap();
         });
@@ -251,7 +258,7 @@ where
     ) -> eyre::Result<Self::Network> {
         let block_source_config = self.block_source_config.clone();
         let debug_cutoff_height = self.debug_cutoff_height;
-        let (fcu_trigger_tx, fcu_trigger_rx) = oneshot::channel();
+        let (fcu_trigger_tx, fcu_trigger_rx) = mpsc::unbounded_channel();
         let handle = ctx.start_network(
             NetworkManager::builder(self.network_config(ctx, fcu_trigger_rx)?).await?,
             pool,
@@ -261,12 +268,17 @@ where
         info!(target: "reth::cli", enode=%local_node_record, "P2P networking initialized");
 
         if let Some(block_source_config) = block_source_config {
-            let next_block_number = ctx
+            let finish_block = ctx
                 .provider()
                 .get_stage_checkpoint(StageId::Finish)?
                 .unwrap_or_default()
-                .block_number +
-                1;
+                .block_number;
+            let bodies_block = ctx
+                .provider()
+                .get_stage_checkpoint(StageId::Bodies)?
+                .unwrap_or_default()
+                .block_number;
+            let next_block_number = std::cmp::max(finish_block, bodies_block) + 1;
 
             // Give the block store a handle to the node's database so it can
             // resolve hash→number directly instead of scanning the block source.
@@ -285,31 +297,44 @@ where
                     )
                     .await;
 
-                // Read the latest block and send its hash to trigger the pipeline
-                // via a direct forkchoice update. This must happen before
-                // start_pseudo_peer (which never returns).
-                // get_by_number auto-indexes the block's hash AND parent hash.
-                if let Some(latest) = block_store.find_latest_block_number().await {
-                    match block_store.get_by_number(latest).await {
-                        Ok(block) => {
-                            let hash = block.hash();
-                            info!(
-                                target: "reth::cli",
-                                number = %latest,
-                                hash = %hash,
-                                "Sending forkchoice trigger from block source"
-                            );
-                            let _ = fcu_trigger_tx.send(hash);
+                let fcu_block_store = block_store.clone();
+                let fcu_trigger_tx = fcu_trigger_tx.clone();
+                tokio::spawn(async move {
+                    let mut last_sent = None;
+                    let polling_interval = fcu_block_store
+                        .polling_interval()
+                        .max(std::time::Duration::from_secs(1));
+                    loop {
+                        if let Some(latest) = fcu_block_store.find_latest_block_number().await
+                            && last_sent != Some(latest)
+                        {
+                            match fcu_block_store.get_by_number(latest).await {
+                                Ok(block) => {
+                                    let hash = block.hash();
+                                    info!(
+                                        target: "reth::cli",
+                                        number = %latest,
+                                        hash = %hash,
+                                        "Queueing forkchoice trigger from block source"
+                                    );
+                                    if fcu_trigger_tx.send(hash).is_err() {
+                                        break;
+                                    }
+                                    last_sent = Some(latest);
+                                }
+                                Err(e) => {
+                                    info!(
+                                        target: "reth::cli",
+                                        number = %latest,
+                                        %e,
+                                        "Failed to read latest block for forkchoice trigger"
+                                    );
+                                }
+                            }
                         }
-                        Err(e) => {
-                            info!(
-                                target: "reth::cli",
-                                %e,
-                                "Failed to read latest block for forkchoice trigger"
-                            );
-                        }
+                        tokio::time::sleep(polling_interval).await;
                     }
-                }
+                });
 
                 start_pseudo_peer(
                     chain_spec.clone(),
