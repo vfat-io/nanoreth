@@ -204,27 +204,27 @@ fn system_tx_to_reth_transaction(
     } else if tx.input.is_empty() {
         // Native HYPE transfer: sender is the HYPE system address (0x2222…2222), encoded `s == 1`.
         U256::from(0x1)
+    } else if let Some(spot) = SPOT_EVM_MAP.read().unwrap().get(&to) {
+        spot.to_s()
     } else {
-        loop {
-            if let Some(spot) = SPOT_EVM_MAP.read().unwrap().get(&to) {
-                break spot.to_s();
-            }
-
-            // Cache miss - single-flight the API fetch so concurrent misses don't
-            // each hit the API. Only the thread holding SPOT_FETCH_LOCK fetches;
-            // the rest block here and re-check the cache once it's released.
-            let _fetch_guard = SPOT_FETCH_LOCK.lock().unwrap();
-
-            // Double-checked: another thread may have populated the cache while we
-            // waited for the fetch lock.
-            if SPOT_EVM_MAP.read().unwrap().contains_key(&to) {
-                continue;
-            }
-
+        // Only the thread holding the fetch lock may refresh metadata. Threads
+        // that waited for it re-check the cache before issuing another request.
+        let _fetch_guard = SPOT_FETCH_LOCK.lock().unwrap();
+        if let Some(spot) = SPOT_EVM_MAP.read().unwrap().get(&to) {
+            spot.to_s()
+        } else {
+            // Cache miss - fetch from API once, update cache, and persist to database.
+            // If the refreshed map still lacks the contract, fail fast instead of
+            // hammering the metadata API in a tight loop.
             info!("Contract not found: {to:?} from spot mapping, fetching from API...");
             let metadata = erc20_contract_to_spot_token(chain_id).unwrap();
+            let spot = metadata
+                .get(&to)
+                .unwrap_or_else(|| panic!("Contract not found in refreshed spot metadata: {to:?}"));
+            let s = spot.to_s();
             *SPOT_EVM_MAP.write().unwrap() = metadata.clone();
             persist_spot_metadata_to_db(&metadata);
+            s
         }
     };
     let signature = Signature::new(U256::from(0x1), s, true);

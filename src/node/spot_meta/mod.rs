@@ -139,6 +139,13 @@ pub(crate) fn erc20_contract_to_spot_token(chain_id: u64) -> Result<BTreeMap<Add
         patch::patch_testnet_spot_meta(&mut map);
     }
 
+    if chain_id == MAINNET_CHAIN_ID {
+        // Historical HyperEVM blocks still contain system txs for the legacy USDC
+        // contract, but the live spotMeta response only exposes the current USDC
+        // EVM contract. Keep the old contract mapped to spot index 0.
+        map.insert("0xb88339cb7199b77e23db6e890353e22632ba630f".parse()?, SpotId { index: 0 });
+    }
+
     // Apply CLI/env manual overrides last so they win over both the fetched
     // metadata and the built-in patches.
     for (address, index) in collect_manual_overrides() {
