@@ -67,3 +67,36 @@ fn parse_hl_query(query: Option<&str>, default: bool) -> bool {
 pub fn is_hl_compliant(extensions: &Extensions, default: bool) -> bool {
     extensions.get::<HlComplianceMode>().map_or(default, |m| m.0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_override_wins_over_default() {
+        assert!(!parse_hl_query(Some("hl=false"), true));
+        assert!(parse_hl_query(Some("hl=true"), false));
+        assert!(!parse_hl_query(Some("other=1&hl=0"), true));
+        assert!(parse_hl_query(Some("other=1&hl=1"), false));
+    }
+
+    #[test]
+    fn missing_query_or_extension_uses_default() {
+        assert!(parse_hl_query(None, true));
+        assert!(!parse_hl_query(Some("other=1"), false));
+
+        let extensions = Extensions::new();
+        assert!(is_hl_compliant(&extensions, true));
+        assert!(!is_hl_compliant(&extensions, false));
+    }
+
+    #[test]
+    fn request_extension_wins_over_default() {
+        let mut extensions = Extensions::new();
+        extensions.insert(HlComplianceMode(false));
+        assert!(!is_hl_compliant(&extensions, true));
+
+        extensions.insert(HlComplianceMode(true));
+        assert!(is_hl_compliant(&extensions, false));
+    }
+}
