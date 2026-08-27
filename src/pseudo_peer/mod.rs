@@ -34,8 +34,27 @@ pub mod prelude {
 }
 
 use crate::{chainspec::HlChainSpec, node::network::HlNetworkPrimitives};
+use reth_discv4::NodeRecord;
 use reth_network::{NetworkEvent, NetworkEventListenerProvider, NetworkHandle};
 use reth_network_api::{Peers, PeersInfo};
+use std::str::FromStr;
+
+pub enum PseudoPeerDestination {
+    Network(NetworkHandle<HlNetworkPrimitives>),
+    Peer(String),
+}
+
+impl From<NetworkHandle<HlNetworkPrimitives>> for PseudoPeerDestination {
+    fn from(network: NetworkHandle<HlNetworkPrimitives>) -> Self {
+        Self::Network(network)
+    }
+}
+
+impl From<String> for PseudoPeerDestination {
+    fn from(peer: String) -> Self {
+        Self::Peer(peer)
+    }
+}
 
 fn configure_pseudo_peer_connection(
     pseudo_peer: &NetworkHandle<HlNetworkPrimitives>,
@@ -57,9 +76,9 @@ fn block_poller_enabled() -> bool {
 }
 
 /// Main function that starts the network manager and processes eth requests
-pub async fn start_pseudo_peer(
+pub async fn start_pseudo_peer<D: Into<PseudoPeerDestination>>(
     chain_spec: Arc<HlChainSpec>,
-    destination_network: NetworkHandle<HlNetworkPrimitives>,
+    destination: D,
     block_store: Arc<BlockStore>,
     debug_cutoff_height: Option<u64>,
     start_block_number: Option<u64>,
@@ -91,14 +110,28 @@ pub async fn start_pseudo_peer(
         info!("Block poller disabled by NANORETH_DISABLE_BLOCK_POLLER");
     }
 
-    // Directly add the main node as a peer (bypasses discovery)
-    let node_record = destination_network.local_node_record();
+    // Directly add the main node as a peer (bypasses discovery). Integrated mode can
+    // register trust in both directions; standalone mode can only configure its own handle.
+    let (node_record, destination_network) = match destination.into() {
+        PseudoPeerDestination::Network(network) => {
+            (network.local_node_record(), Some(network))
+        }
+        PseudoPeerDestination::Peer(peer) => {
+            let node_record = NodeRecord::from_str(&peer)
+                .map_err(|e| eyre::eyre!("Failed to parse destination peer: {e}"))?;
+            (node_record, None)
+        }
+    };
     info!(
         peer_id = %node_record.id,
         addr = %node_record.tcp_addr(),
         "Adding main node as direct peer"
     );
-    configure_pseudo_peer_connection(&network_handle, &destination_network);
+    if let Some(destination_network) = destination_network {
+        configure_pseudo_peer_connection(&network_handle, &destination_network);
+    } else {
+        network_handle.add_trusted_peer(node_record.id, node_record.tcp_addr());
+    }
 
     let mut first = true;
 
@@ -160,12 +193,18 @@ mod tests {
         let pseudo_dir = TempDir::new().unwrap();
         let destination_dir = TempDir::new().unwrap();
         let (pseudo_network, _) =
-            create_network_manager(HlChainSpec::default(), local_store(pseudo_dir.path()), None)
-                .await
-                .unwrap();
+            create_network_manager(
+                HlChainSpec::default(),
+                local_store(pseudo_dir.path()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         let (destination_network, _) = create_network_manager(
             HlChainSpec::default(),
             local_store(destination_dir.path()),
+            None,
             None,
         )
         .await
