@@ -83,6 +83,8 @@ const BIG_BLOCK_GAS_LIMIT: u64 = 30_000_000;
 /// `debug_traceCall`, `trace_call` and related methods). Upstream reth uses the block gas limit.
 /// On a small block that rejects transactions that are valid in a big block, so this never goes
 /// below the big block gas limit, like hl-node. A non-zero RPC gas cap still applies.
+/// This is simulation capacity; the caller's HyperCore block-mode flag still controls inclusion.
+/// The selected block environment, including the `GASLIMIT` opcode, is left unchanged.
 pub(crate) fn rpc_gas_ceiling(block_gas_limit: u64, rpc_gas_cap: u64) -> u64 {
     let ceiling = block_gas_limit.max(BIG_BLOCK_GAS_LIMIT);
     if rpc_gas_cap == 0 { ceiling } else { ceiling.min(rpc_gas_cap) }
