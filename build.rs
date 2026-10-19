@@ -1,4 +1,4 @@
-use std::{env, error::Error};
+use std::{env, error::Error, path::Path, process::Command};
 use vergen::{BuildBuilder, CargoBuilder, Emitter};
 use vergen_git2::Git2Builder;
 
@@ -19,6 +19,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     emitter.add_instructions(&git_builder)?;
 
     emitter.emit_and_set()?;
+    // Vergen watches HEAD, but a commit on the same branch updates its ref rather than HEAD.
+    // Track the ref too so cached builds cannot advertise the preceding source revision.
+    if let Some(head_ref) = git_output(&["symbolic-ref", "--quiet", "HEAD"]) {
+        for name in [head_ref.as_str(), "packed-refs"] {
+            if let Some(path) = git_output(&["rev-parse", "--git-path", name])
+                && (name != "packed-refs" || Path::new(&path).exists())
+            {
+                println!("cargo:rerun-if-changed={path}");
+            }
+        }
+    }
     let sha = env::var("VERGEN_GIT_SHA")?;
     let sha_short = &sha[0..7];
 
@@ -88,4 +99,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     Ok(())
+}
+
+fn git_output(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
