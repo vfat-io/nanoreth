@@ -23,10 +23,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Track the ref too so cached builds cannot advertise the preceding source revision.
     if let Some(head_ref) = git_output(&["symbolic-ref", "--quiet", "HEAD"]) {
         for name in [head_ref.as_str(), "packed-refs"] {
-            if let Some(path) = git_output(&["rev-parse", "--git-path", name]) {
-                if name != "packed-refs" || Path::new(&path).exists() {
-                    println!("cargo:rerun-if-changed={path}");
-                }
+            if let Some(path) = git_output(&["rev-parse", "--git-path", name])
+                && (name != "packed-refs" || Path::new(&path).exists())
+            {
+                println!("cargo:rerun-if-changed={path}");
             }
         }
     }
