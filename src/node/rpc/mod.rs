@@ -66,6 +66,9 @@ pub mod precompile;
 mod simulate;
 mod transaction;
 
+#[cfg(test)]
+mod execution_tests;
+
 pub trait HlRpcNodeCore: RpcNodeCore<Primitives: NodePrimitives<Block = HlBlock>> {}
 
 /// Gas limit of a HyperEVM big block.
