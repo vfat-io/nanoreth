@@ -4,12 +4,23 @@ use alloy_primitives::B256;
 use futures::future::BoxFuture;
 use parking_lot::RwLock;
 use reth_network::cache::LruMap;
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
+use tokio::sync::watch;
 use tracing::info;
+
+/// A head whose complete block has been received from the configured source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockSourceHead {
+    pub number: u64,
+    pub hash: B256,
+}
+
+impl BlockSourceHead {
+    pub fn supersedes(self, previous: Self) -> bool {
+        self.number > previous.number
+            || (self.number == previous.number && self.hash < previous.hash)
+    }
+}
 
 /// Function that resolves a block hash to its number via the node's database.
 /// Returns `None` if the hash is not yet in the database (e.g. headers not synced yet).
@@ -35,6 +46,7 @@ pub struct BlockStore {
     source: BlockSourceBoxed,
     /// Hardcoded testnet gap blocks missing from upstream sources
     gap_blocks: HashMap<u64, BlockAndReceipts>,
+    received_head: watch::Sender<Option<BlockSourceHead>>,
 }
 
 impl std::fmt::Debug for BlockStore {
@@ -66,6 +78,7 @@ impl BlockStore {
             db_block_number,
             source,
             gap_blocks,
+            received_head: watch::channel(None).0,
         }
     }
 
@@ -73,6 +86,19 @@ impl BlockStore {
     pub fn index_block(&self, block: &BlockAndReceipts) {
         let mut idx = self.hash_index.write();
         Self::index_block_inner(&mut idx, block);
+        let head = BlockSourceHead { number: block.number(), hash: block.hash() };
+        self.received_head.send_if_modified(|previous| {
+            if previous.is_none_or(|previous| head.supersedes(previous)) {
+                *previous = Some(head);
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    pub fn received_head_updates(&self) -> watch::Receiver<Option<BlockSourceHead>> {
+        self.received_head.subscribe()
     }
 
     /// Index a block into an already-held write guard. Avoids repeated lock acquisition.
@@ -102,10 +128,7 @@ impl BlockStore {
     }
 
     /// Fetch multiple blocks by number. Auto-indexes and caches.
-    pub async fn get_by_numbers(
-        &self,
-        heights: Vec<u64>,
-    ) -> eyre::Result<Vec<BlockAndReceipts>> {
+    pub async fn get_by_numbers(&self, heights: Vec<u64>) -> eyre::Result<Vec<BlockAndReceipts>> {
         let mut cached: HashMap<u64, BlockAndReceipts> = HashMap::new();
         let mut uncached_heights = Vec::new();
         {
@@ -156,9 +179,10 @@ impl BlockStore {
 
         // Fallback: database lookup (MDBX is mmap'd, no need to re-cache)
         if let Some(ref db_fn) = self.db_block_number
-            && let Some(n) = db_fn(hash) {
-                return Ok(n);
-            }
+            && let Some(n) = db_fn(hash)
+        {
+            return Ok(n);
+        }
 
         Err(eyre::eyre!("Hash not found in index or database: {hash:?}"))
     }

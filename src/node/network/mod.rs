@@ -9,9 +9,8 @@ use crate::{
         rpc::engine_api::payload::HlPayloadTypes,
         types::ReadPrecompileCalls,
     },
-    pseudo_peer::{BlockSourceConfig, DbBlockNumberFn, start_pseudo_peer},
+    pseudo_peer::{BlockSourceConfig, BlockSourceHead, DbBlockNumberFn, start_pseudo_peer},
 };
-use alloy_primitives::B256;
 use alloy_rlp::{Decodable, Encodable};
 use alloy_rpc_types::engine::ForkchoiceState;
 use reth::{
@@ -32,11 +31,142 @@ use reth_storage_api::BlockNumReader;
 use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tracing::{info, warn};
 
 pub mod block_import;
+
+/// Received blocks can advance forkchoice without waiting for remote head discovery.
+async fn forward_received_heads(
+    mut heads: watch::Receiver<Option<BlockSourceHead>>,
+    targets: mpsc::UnboundedSender<BlockSourceHead>,
+) {
+    let mut cadence = tokio::time::interval(Duration::from_millis(100));
+    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_forwarded = None;
+    loop {
+        cadence.tick().await;
+        let head = *heads.borrow_and_update();
+        if let Some(head) = head
+            && last_forwarded.is_none_or(|last| head.supersedes(last))
+        {
+            if targets.send(head).is_err() {
+                return;
+            }
+            last_forwarded = Some(head);
+        }
+        if heads.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// A delayed discovery result must not rewind a head already supplied by received blocks.
+async fn next_source_head(
+    targets: &mut mpsc::UnboundedReceiver<BlockSourceHead>,
+    previous: &mut Option<BlockSourceHead>,
+) -> Option<BlockSourceHead> {
+    while let Some(head) = targets.recv().await {
+        if previous.is_none_or(|previous| head.supersedes(previous)) {
+            *previous = Some(head);
+            return Some(head);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod source_head_notification_tests {
+    use super::*;
+    use crate::{
+        HlBlockBody, HlHeader,
+        node::types::BlockAndReceipts,
+        pseudo_peer::{BlockStore, LocalBlockSource},
+    };
+    use alloy_primitives::B256;
+
+    fn block(number: u64) -> BlockAndReceipts {
+        let mut header = HlHeader::default();
+        header.inner.number = number;
+        BlockAndReceipts::from_db(
+            HlBlock {
+                header,
+                body: HlBlockBody {
+                    inner: Default::default(),
+                    sidecars: None,
+                    read_precompile_calls: None,
+                    highest_precompile_address: None,
+                },
+            },
+            Vec::new(),
+        )
+    }
+
+    fn store() -> BlockStore {
+        // No files exist here: received blocks must not depend on source head discovery.
+        BlockStore::new(
+            Arc::new(Box::new(LocalBlockSource::new(std::path::PathBuf::from(
+                "/unused-source-head-notification-test",
+            )))),
+            None,
+            999,
+        )
+    }
+
+    #[tokio::test]
+    async fn source_head_notifications_do_not_wait_for_discovery() {
+        let store = store();
+        let (targets, mut receiver) = mpsc::unbounded_channel();
+        let forwarding =
+            tokio::spawn(forward_received_heads(store.received_head_updates(), targets));
+        let received = block(42);
+        store.index_block(&received);
+        let target = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("received block should advance head without discovery")
+            .unwrap();
+        assert_eq!(target, BlockSourceHead { number: 42, hash: received.hash() });
+        forwarding.abort();
+    }
+
+    #[tokio::test]
+    async fn source_head_notifications_ignore_late_discovery() {
+        let store = store();
+        store.index_block(&block(40));
+        let newest = block(42);
+        store.index_block(&newest);
+        store.index_block(&block(41));
+        let (targets, mut receiver) = mpsc::unbounded_channel();
+        let forwarding =
+            tokio::spawn(forward_received_heads(store.received_head_updates(), targets.clone()));
+        let mut previous = None;
+        let head = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_source_head(&mut receiver, &mut previous),
+        )
+        .await
+        .expect("already received head should be delivered")
+        .unwrap();
+        assert_eq!(head, BlockSourceHead { number: 42, hash: newest.hash() });
+
+        targets.send(BlockSourceHead { number: 41, hash: B256::ZERO }).unwrap();
+        targets.send(head).unwrap();
+        targets.send(BlockSourceHead { number: 42, hash: B256::repeat_byte(255) }).unwrap();
+        let next = block(43);
+        store.index_block(&next);
+        let head = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_source_head(&mut receiver, &mut previous),
+        )
+        .await
+        .expect("late discovery must not block the next received head")
+        .unwrap();
+        assert_eq!(head, BlockSourceHead { number: 43, hash: next.hash() });
+        forwarding.abort();
+    }
+}
 
 /// HL `NewBlock` message value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,7 +293,7 @@ impl HlNetworkBuilder {
     pub fn network_config<Node>(
         self,
         ctx: &BuilderContext<Node>,
-        mut fcu_trigger_rx: mpsc::UnboundedReceiver<B256>,
+        mut fcu_trigger_rx: mpsc::UnboundedReceiver<BlockSourceHead>,
     ) -> eyre::Result<NetworkConfig<Node::Provider, HlNetworkPrimitives>>
     where
         Node: FullNodeTypes<Types = HlNode>,
@@ -189,7 +319,10 @@ impl HlNetworkBuilder {
                 // sees an unknown finalized hash and triggers the pipeline.
                 // If finalized is set to the current best block (which is already
                 // known), reth concludes "fully synced" and never starts backfill.
-                while let Some(target_hash) = fcu_trigger_rx.recv().await {
+                let mut previous = None;
+                while let Some(target) = next_source_head(&mut fcu_trigger_rx, &mut previous).await
+                {
+                    let target_hash = target.hash;
                     let state = ForkchoiceState {
                         head_block_hash: target_hash,
                         safe_block_hash: target_hash,
@@ -283,9 +416,8 @@ where
             // Give the block store a handle to the node's database so it can
             // resolve hash→number directly instead of scanning the block source.
             let provider = ctx.provider().clone();
-            let db_block_number: DbBlockNumberFn = Arc::new(move |hash| {
-                provider.block_number(hash).ok().flatten()
-            });
+            let db_block_number: DbBlockNumberFn =
+                Arc::new(move |hash| provider.block_number(hash).ok().flatten());
 
             let chain_spec = ctx.chain_spec();
             ctx.task_executor().spawn_critical("pseudo peer", async move {
@@ -298,12 +430,15 @@ where
                     .await;
 
                 let fcu_block_store = block_store.clone();
+                tokio::spawn(forward_received_heads(
+                    block_store.received_head_updates(),
+                    fcu_trigger_tx.clone(),
+                ));
                 let fcu_trigger_tx = fcu_trigger_tx.clone();
                 tokio::spawn(async move {
                     let mut last_sent = None;
-                    let polling_interval = fcu_block_store
-                        .polling_interval()
-                        .max(std::time::Duration::from_secs(1));
+                    let polling_interval =
+                        fcu_block_store.polling_interval().max(std::time::Duration::from_secs(1));
                     loop {
                         if let Some(latest) = fcu_block_store.find_latest_block_number().await
                             && last_sent != Some(latest)
@@ -317,7 +452,10 @@ where
                                         hash = %hash,
                                         "Queueing forkchoice trigger from block source"
                                     );
-                                    if fcu_trigger_tx.send(hash).is_err() {
+                                    if fcu_trigger_tx
+                                        .send(BlockSourceHead { number: latest, hash })
+                                        .is_err()
+                                    {
                                         break;
                                     }
                                     last_sent = Some(latest);
