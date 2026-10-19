@@ -184,10 +184,12 @@ where
         if !request_has_gas_limit && tx_env.gas_price() > 0 {
             trace!(target: "rpc::eth::call", ?tx_env, "Applying gas limit cap with caller allowance");
             let cap = self.caller_gas_allowance(db, &evm_env, &tx_env)?;
-            // An explicit block gas limit override stays the ceiling.
+            // Keep an explicit block override as the ceiling, subject to the operator's RPC cap.
             let ceiling = block_gas_limit_override.unwrap_or_else(|| {
                 rpc_gas_ceiling(evm_env.block_env.gas_limit, self.call_gas_limit())
             });
+            let rpc_gas_cap = self.call_gas_limit();
+            let ceiling = if rpc_gas_cap == 0 { ceiling } else { ceiling.min(rpc_gas_cap) };
             tx_env.set_gas_limit(cap.min(ceiling));
         }
 
